@@ -45,7 +45,7 @@ for i in board_range:
     BOARD_SPANS.append(c_ind)
 # Index arrays for both right-left and left-right diagonals
 d1_ind = [board_range, board_range]
-d2_ind = [np.flip(board_range, 0), np.flip(board_range, 0)]
+d2_ind = [np.flip(board_range, 0), board_range]
 BOARD_SPANS.append(d1_ind)
 BOARD_SPANS.append(d2_ind)
 
@@ -57,17 +57,21 @@ def main():
 
     # Define features for learning agent
     features = _setup_features(p1_x, p2_o)
-    rl_agent = LearningAgent(p1_x, features, args.alpha, args.epsilon)
+    rl_agent = LearningAgent(p1_x, features)
     rand_agent = RandomAgent(p2_o)
     env = environment(rl_agent, rand_agent)
     rl_agent.train(env, initial_state, args.iterations,
+                   alpha=args.alpha,
+                   epsilon=args.epsilon,
                    epsilon_decay=args.epsilon_decay,
                    alpha_decay=args.alpha_decay,
                    debug_callback=_print_debug)
     print("Training complete. Time for you to play!")
     env = environment(rl_agent, HumanAgent(p2_o))
-    rl_agent.train(env, initial_state, 10,
-                   epsilon_decay=args.epsilon_decay,
+    rl_agent.train(env, initial_state, 100,
+                   alpha=0.5,
+                   epsilon=0.0,
+                   epsilon_decay=0.0,
                    alpha_decay=args.alpha_decay,
                    debug_callback=_print_debug)
 
@@ -158,11 +162,9 @@ class BoardState:
 
 
 class LearningAgent:
-    def __init__(self, id, features, alpha=0.5, epsilon=0.3, gamma=0.9):
+    def __init__(self, id, features, gamma=0.9):
         self.id = id
         self.features = features
-        self.alpha = alpha
-        self.epsilon = epsilon
         self.gamma = gamma
         # Initialize weights to length of features + 1 for bias term
         self.weights = np.ones(len(features) + 1)
@@ -176,14 +178,13 @@ class LearningAgent:
         return a
 
     def train(self, env, initial_state, itr_count,
+              alpha=0.2, epsilon=0.5,
               epsilon_decay=0.01, alpha_decay=0.001, debug_callback=None):
         def q_func(f_vals):
             return np.dot(self.weights, f_vals)
         n = 0
         expected_reward = 0.0
         sum_rewards = 0.0
-        epsilon = self.epsilon
-        alpha = self.alpha
         while n < itr_count:
             n += 1
             s = initial_state
@@ -241,33 +242,6 @@ class RandomAgent:
         return actions[np.random.choice(xrange(len(actions)))]
 
 
-def feature_count_moves(v):
-    """Return a feature function for counting moves.
-
-    Counts number of moves on the board for v.
-    """
-    max_moves = BOARD_SIZE**2 / 2.0
-    return lambda s, a: _normalize(s.update(a, v).count(v), 0, max_moves)
-
-
-def feature_score_span(v, t_ind):
-    """Return a feature function for scoring board spans for v.
-
-    The score is increased for each index of the vector in the board that has a
-    value matching v and decreased for each non-zero value that does
-    not match v.
-    """
-    def func(s, a):
-        t = s.update(a, v)[t_ind]
-        raw_score = 0
-        for x in t:
-            if x == v:
-                raw_score += 1
-            elif x != 0:
-                raw_score -= 1
-        return _normalize(raw_score, -len(t), len(t))
-    return func
-
 class HumanAgent:
     def __init__(self, id):
         self.id = id
@@ -280,10 +254,45 @@ class HumanAgent:
         valid = False
         while not valid:
             val = input('Specify coordinate for your move x,y: ')
-            valid = isinstance(val, tuple) and all([isinstance(x, int) for x in val])
+            valid = isinstance(val, tuple) \
+                    and all([isinstance(x, int) for x in val]) \
+                    and val in actions
             if not valid:
                 print('Invalid value. Try again.')
         return val
+
+
+def feature_count_moves(v):
+    """Return a feature function for counting moves.
+
+    Counts number of moves on the board for v.
+    """
+    max_moves = BOARD_SIZE**2 / 2.0
+    return lambda s, a: _normalize(s.update(a, v).count(v), 0, max_moves)
+
+
+def feature_score_span(v):
+    """Return a feature function for scoring board spans for v.
+
+    The score is increased for each index of the vector in the board that has a
+    value matching v and decreased for each non-zero value that does
+    not match v.
+    """
+    def func(s, a):
+        s_n = s.update(a, v)
+        raw_score = 0
+        for i in BOARD_SPANS:
+            t = s_n[i]
+            t_score = 0
+            for x in t:
+                if x == v:
+                    t_score += 1
+                elif x != 0:
+                    t_score -= 1
+            raw_score += t_score ** 3
+        max_score = BOARD_SIZE * BOARD_SIZE * len(BOARD_SPANS)
+        return _normalize(raw_score, -max_score, max_score)
+    return func
 
 # An array of delta coordinates (0,-1), (0,1), (-1, 0), etc. that can be used
 # to get the neighbors of an index. Note that we drop the first element (0,0)
@@ -324,6 +333,8 @@ def _setup_features(p_id, op_id):
     # each feature.
     features.append(feature_score_nearest_neighbors(p_id))
     features.append(feature_score_nearest_neighbors(op_id))
+    features.append(feature_score_span(p_id))
+    features.append(feature_score_span(op_id))
     # Span score feature
     # for s in BOARD_SPANS:
     #    features.append(feature_score_span(p_id, s))
