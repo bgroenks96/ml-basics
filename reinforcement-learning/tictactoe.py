@@ -11,11 +11,11 @@ parser.add_argument("-b", "--board-size", default=3, type=int,
                     help="Size of the tic tac toe game board (NxN)")
 parser.add_argument("-n", "--iterations", default=10, type=int,
                     help="Number of training iterations (games) to run.")
-parser.add_argument("-e", "--epsilon", default=0.2, type=float,
+parser.add_argument("-e", "--epsilon", default=0.5, type=float,
                     help="Probability of random behavior while training. \
                     Affects how often the agent will behave sub-optimally \
                     to help 'explore' the state space.")
-parser.add_argument("-a", "--alpha", default=0.5, type=float,
+parser.add_argument("-a", "--alpha", default=0.2, type=float,
                     help="Learning rate. Controls how quickly the agent \
                     updates its weight values.")
 parser.add_argument("--alpha-decay", default=0.0001, type=float,
@@ -56,14 +56,32 @@ def main():
     initial_state = BoardState()
 
     # Define features for learning agent
-    features = _setup_features(p1_x, p2_o)
-    rl_agent = LearningAgent(p1_x, features)
-    rand_agent = RandomAgent(p2_o)
-    env = environment(rl_agent, rand_agent)
+    features_1 = _setup_features(p1_x, p2_o)
+    features_2 = _setup_features(p2_o, p1_x)
+    rl_agent = LearningAgent(p1_x, features_1)
+    env = environment(rl_agent, RandomAgent(p2_o))
+    print("Training agent...")
     rl_agent.train(env, initial_state, args.iterations,
                    alpha=args.alpha,
                    epsilon=args.epsilon,
                    epsilon_decay=args.epsilon_decay,
+                   alpha_decay=args.alpha_decay,
+                   debug_callback=_print_debug)
+    rl_agent2 = LearningAgent(p2_o, features_2)
+    env = environment(rl_agent2, RandomAgent(p1_x))
+    print("Training adversary...")
+    rl_agent2.train(env, initial_state, args.iterations,
+                    alpha=args.alpha,
+                    epsilon=args.epsilon,
+                    epsilon_decay=args.epsilon_decay,
+                    alpha_decay=args.alpha_decay,
+                    debug_callback=_print_debug)
+    print("Cross training...")
+    env = environment(rl_agent, rl_agent2, epsilon=0.2)
+    rl_agent.train(env, initial_state, args.iterations,
+                   alpha=2*args.alpha,
+                   epsilon=0.2,
+                   epsilon_decay=0.0001,
                    alpha_decay=args.alpha_decay,
                    debug_callback=_print_debug)
     print("Training complete. Time for you to play!")
@@ -76,7 +94,7 @@ def main():
                    debug_callback=_print_debug)
 
 
-def environment(player, opponent):
+def environment(player, opponent, epsilon=0.0):
     """Return an environment function for the given player and opponent.
 
     player - an Agent instance for the acting player
@@ -84,7 +102,7 @@ def environment(player, opponent):
     """
     def env(s, a):
         s_n = s.update(a, player.id)
-        a_o = opponent.act(s_n)
+        a_o = opponent.act(s_n, epsilon=epsilon)
         if a_o is not None:
             s_r = s_n.update(a_o, opponent.id)
         else:
@@ -169,17 +187,17 @@ class LearningAgent:
         # Initialize weights to length of features + 1 for bias term
         self.weights = np.ones(len(features) + 1)
 
-    def act(self, state):
+    def act(self, state, epsilon):
         actions = state.possible_actions()
         if len(actions) == 0:
             return None
         q_vals = [self._qfunc(state, a) for a in actions]
-        a, _ = self._act(state, q_vals, actions, 0.0)
+        a, _ = self._act(state, q_vals, actions, epsilon=epsilon)
         return a
 
     def train(self, env, initial_state, itr_count,
               alpha=0.2, epsilon=0.5,
-              epsilon_decay=0.01, alpha_decay=0.001, debug_callback=None):
+              epsilon_decay=0.001, alpha_decay=0.00001, debug_callback=None):
         def q_func(f_vals):
             return np.dot(self.weights, f_vals)
         n = 0
@@ -235,7 +253,7 @@ class RandomAgent:
     def __init__(self, id):
         self.id = id
 
-    def act(self, state):
+    def act(self, state, epsilon=0.0):
         actions = state.possible_actions()
         if len(actions) == 0:
             return None
@@ -246,7 +264,7 @@ class HumanAgent:
     def __init__(self, id):
         self.id = id
 
-    def act(self, state):
+    def act(self, state, epsilon=0.0):
         actions = state.possible_actions()
         if len(actions) == 0:
             return None
@@ -271,7 +289,7 @@ def feature_count_moves(v):
     return lambda s, a: _normalize(s.update(a, v).count(v), 0, max_moves)
 
 
-def feature_score_span(v):
+def feature_score_span(v, o):
     """Return a feature function for scoring board spans for v.
 
     The score is increased for each index of the vector in the board that has a
@@ -285,12 +303,13 @@ def feature_score_span(v):
             t = s_n[i]
             t_score = 0
             for x in t:
-                if x == v:
+                if x == o:
                     t_score += 1
                 elif x != 0:
                     t_score -= 1
-            raw_score += t_score ** 3
-        max_score = BOARD_SIZE * BOARD_SIZE * len(BOARD_SPANS)
+            raw_score += t_score**3
+        raw_score = np.cbrt(raw_score)
+        max_score = np.cbrt(BOARD_SIZE**3 * len(BOARD_SPANS))
         return _normalize(raw_score, -max_score, max_score)
     return func
 
@@ -300,7 +319,7 @@ def feature_score_span(v):
 neighbor_deltas = np.array(list(it.product([0,-1,1], repeat=2)))[1:]
 
 
-def feature_score_nearest_neighbors(v):
+def feature_score_nearest_neighbors(v, o):
     """Return a feature function for scoring nearest neighbors.
 
     Evaluates the action for a given state by increasing the score for empty
@@ -308,15 +327,21 @@ def feature_score_nearest_neighbors(v):
     opponent.
     """
     def func(s, a):
+        def score(x):
+            if x == o:
+                return 2.0
+            elif x == 0:
+                return 0.5
+            else:
+                return 0
         s_n = s.update(a, v)
         neighbors = [xy for xy in (neighbor_deltas + a)
                      if np.all(xy >= 0) and np.all(xy < BOARD_SIZE)]
         neighbor_indices = zip(*neighbors)
         neighbor_vals = s_n[neighbor_indices]
-        neighbor_scores = [1.0 if x == 0 or x == v else 0.0
-                           for x in neighbor_vals]
-        raw_score = np.sum(neighbor_scores)
-        max_score = 2**BOARD_SIZE
+        neighbor_scores = [score(x)**2 for x in neighbor_vals]
+        raw_score = np.sqrt(np.sum(neighbor_scores))
+        max_score = np.sqrt(4*2**BOARD_SIZE)
         return _normalize(raw_score, 0, max_score)
     return func
 
@@ -331,14 +356,9 @@ def _setup_features(p_id, op_id):
     # We add each feature once per player. This allows the learning agent
     # to "see" both its own standing and its opponent's standing relative to
     # each feature.
-    features.append(feature_score_nearest_neighbors(p_id))
-    features.append(feature_score_nearest_neighbors(op_id))
-    features.append(feature_score_span(p_id))
-    features.append(feature_score_span(op_id))
-    # Span score feature
-    # for s in BOARD_SPANS:
-    #    features.append(feature_score_span(p_id, s))
-    #    features.append(feature_score_span(op_id, s))
+    features.append(feature_score_nearest_neighbors(p_id, op_id))
+    features.append(feature_score_span(p_id, p_id))
+    features.append(feature_score_span(p_id, op_id))
     return features
 
 def _print_debug(n, s, weights, expected_reward, alpha, epsilon):
