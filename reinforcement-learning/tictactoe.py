@@ -55,9 +55,11 @@ def main():
     p2_o = 2
     initial_state = BoardState()
 
-    # Define features for learning agent
+    # Define features for learning agent;
+    # Parameter order matters, so we need two separate sets, per agent
     features_1 = _setup_features(p1_x, p2_o)
     features_2 = _setup_features(p2_o, p1_x)
+    # Train primary agent against random agent
     rl_agent = LearningAgent(p1_x, features_1)
     env = environment(rl_agent, RandomAgent(p2_o))
     print("Training agent...")
@@ -67,6 +69,7 @@ def main():
                    epsilon_decay=args.epsilon_decay,
                    alpha_decay=args.alpha_decay,
                    debug_callback=_print_debug)
+    # Train adversary against random agent
     rl_agent2 = LearningAgent(p2_o, features_2)
     env = environment(rl_agent2, RandomAgent(p1_x))
     print("Training adversary...")
@@ -76,6 +79,7 @@ def main():
                     epsilon_decay=args.epsilon_decay,
                     alpha_decay=args.alpha_decay,
                     debug_callback=_print_debug)
+    # Train primary agent against adversary
     print("Cross training...")
     env = environment(rl_agent, rl_agent2, epsilon=0.2)
     rl_agent.train(env, initial_state, args.iterations,
@@ -84,6 +88,7 @@ def main():
                    epsilon_decay=0.0001,
                    alpha_decay=args.alpha_decay,
                    debug_callback=_print_debug)
+    # Train against human player (mostly for demonstration)
     print("Training complete. Time for you to play!")
     env = environment(rl_agent, HumanAgent(p2_o))
     rl_agent.train(env, initial_state, 100,
@@ -168,6 +173,7 @@ class BoardState:
         return 0 if np.all(self.board != 0) else -1
 
     def dump(self):
+        """Prints a graphical depiction of the board state to the console."""
         def tostr(x):
             if x == 1.0:
                 return 'X'
@@ -181,6 +187,7 @@ class BoardState:
 
 class LearningAgent:
     def __init__(self, id, features, gamma=0.9):
+        """Initialize a new LearningAgent with the given board ID, learnable features, and gamma parameter."""
         self.id = id
         self.features = features
         self.gamma = gamma
@@ -188,6 +195,10 @@ class LearningAgent:
         self.weights = np.ones(len(features) + 1)
 
     def act(self, state, epsilon):
+        """Select an action for the given state based on the agents current parameters.
+
+        Will emit a random action with probability epsilon.
+        """
         actions = state.possible_actions()
         if len(actions) == 0:
             return None
@@ -198,7 +209,15 @@ class LearningAgent:
     def train(self, env, initial_state, itr_count,
               alpha=0.2, epsilon=0.5,
               epsilon_decay=0.001, alpha_decay=0.00001, debug_callback=None):
-        def q_func(f_vals):
+        """Trains the agent starting with initial_state against the given environment env for itr_count iterations.
+
+        alpha - the learning rate for weight updates
+        epsilon - probability with which the agent will act randomly instead of optimally
+        epsilon_decay - amount that epsilon should be reduced after each training iteration
+        alpha_decay - amount that alpha should be reduced after each training iteration
+        """
+        # Same as _qfunc but uses a precomputed set of feature values.
+        def qf(f_vals):
             return np.dot(self.weights, f_vals)
         n = 0
         expected_reward = 0.0
@@ -206,25 +225,38 @@ class LearningAgent:
         while n < itr_count:
             n += 1
             s = initial_state
+            status = -1
             actions = s.possible_actions()
             while len(actions) > 0:
+                # Compute feature values for every action given the current state
+                # Note: This is actually a matrix of feature vectors and actions
                 f_vals = np.array([self._feature_values(s, a) for a in actions])
-                q_vals = np.array([q_func(f_v) for f_v in f_vals])
+                # Compute Q values (expected reward) for each set of feature values
+                q_vals = np.array([qf(f_v) for f_v in f_vals])
+                # Select an action based on our current state and Q values
                 action, ind = self._act(s, q_vals, actions, epsilon)
+                # Feed the action back into the environment, update the current state, and get our reward
                 s, r, status = env(s, action)
+                # Update weights according to the new state, reward, and predicted Q value.
                 actions = self._update(s, r, q_vals[ind], f_vals[ind], alpha)
             sum_rewards += r
             expected_reward = sum_rewards / n
             if debug_callback is not None:
                 debug_callback(n, s, self.weights, expected_reward, alpha, epsilon)
-            # Update values for next iteration
+            # Update alpha/epsilon values for next iteration
             alpha = max(0.0, alpha - alpha_decay)
             epsilon = max(0.0, epsilon - epsilon_decay)
 
     def _qfunc(self, state, action):
+        """Return the approximate Q value for the given state and action.
+
+        Approximate Q function simply amounts to a linear combination of our learned weights with each feature
+        function evaluated for state and action.
+        """
         return np.dot(self.weights, self._feature_values(state, action))
 
     def _feature_values(self, state, action):
+        """Return the result of applying each feature function to 'state' and 'action'"""
         # Compute values for features given state and action
         f_vals = [f(state, action) for f in self.features]
         # Append 1 to f_vals to represent bias term
@@ -232,15 +264,30 @@ class LearningAgent:
         return f_vals
 
     def _update(self, s, r, q_p, f_vals, alpha):
+        """Updates the learned weight values based on the reward, new state, and previous outputs.
+
+        s - new state after taking our previous action
+        r - reward given by the environment
+        q_p - predicted Q value for the previous state and selected action
+        f_vals - feature values evaluated for the previous state and selected action
+        alpha - learning rate
+        """
         assert len(f_vals) == len(self.weights)
         actions = s.possible_actions()
+        # Compute Q values for new state s based on current approximation
         q_vs = np.array([self._qfunc(s, a) for a in actions])
+        # Assume optimal future behavior (see: Bellman-Ford equation)
         q_max = np.max(q_vs) if len(q_vs) > 0 else 0
-        diff = alpha * (r + self.gamma * q_max - q_p)
-        self.weights += diff * f_vals
+        # Calculate delta term, i.e. partial derivative of Q function with respect to each weight
+        delta = alpha * (r + self.gamma * q_max - q_p) * f_vals
+        self.weights += delta
         return actions
 
     def _act(self, state, q_vals, actions, epsilon):
+        """Returns a tuple of the selected action and its index in the given action list.
+
+        Acts "optimally" with probability (1 - epsilon) and randomly with probability epsilon.
+        """
         assert len(q_vals) == len(actions)
         if np.random.choice([True, False], p=[1 - epsilon, epsilon]):
             ind = np.argmax(q_vals)
@@ -249,6 +296,7 @@ class LearningAgent:
         return (actions[ind], ind)
 
 
+# Agent implementation that always selects actions at random.
 class RandomAgent:
     def __init__(self, id):
         self.id = id
@@ -260,6 +308,7 @@ class RandomAgent:
         return actions[np.random.choice(xrange(len(actions)))]
 
 
+# Agent implementation that asks for console input from the user.
 class HumanAgent:
     def __init__(self, id):
         self.id = id
@@ -352,10 +401,12 @@ def _normalize(v, min, max):
 
 
 def _setup_features(p_id, op_id):
+    """Returns features to be used by the learning agents.
+
+    p_id - board ID value for the acting player
+    op_id - board ID value for the opposing player
+    """
     features = []
-    # We add each feature once per player. This allows the learning agent
-    # to "see" both its own standing and its opponent's standing relative to
-    # each feature.
     features.append(feature_score_nearest_neighbors(p_id, op_id))
     features.append(feature_score_span(p_id, p_id))
     features.append(feature_score_span(p_id, op_id))
